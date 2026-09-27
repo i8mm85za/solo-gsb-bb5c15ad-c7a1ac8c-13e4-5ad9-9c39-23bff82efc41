@@ -77,10 +77,20 @@ def compute_bias(reference: float, tolerance: float, readings: list[float]) -> t
 
 
 def interpolate(t: float, t0: float, b0: float, t1: float, b1: float) -> float:
-    """在相邻时点 (t0, b0) 与 (t1, b1) 之间对 t 做线性插值。"""
+    """在相邻时点 (t0, b0) 与 (t1, b1) 之间对 t 做线性插值（凸组合形式）。
+
+    结果写成 (1−w)·b0 + w·b1，其中 w = (t−t0)/(t1−t0) ∈ [0, 1]，
+    而不是 b0 + (b1−b0)·w：两端偏差幅值接近 float 上界且符号相反时
+    （如 b0 = 1e308、b1 = −1e308），b1−b0 会先溢出为 ±Infinity，
+    使本应有限的插值结果变成 Infinity。凸组合只做 [0,1] 权重的缩放与
+    相加——两端同号时 |结果| ≤ max(|b0|, |b1|) 天然不溢出；两端异号时
+    缩放先把两数幅值各减半以下，相加也不会溢出。恰在端点（w 为 0/1）时
+    结果严格等于原端点偏差，观测点与区间端点的偏差始终保持原样。
+    """
     if t1 == t0:
         return b0
-    return b0 + (b1 - b0) * (t - t0) / (t1 - t0)
+    w = (t - t0) / (t1 - t0)
+    return (1.0 - w) * b0 + w * b1
 
 
 def integrate_segment(t0: float, b0: float, t1: float, b1: float) -> tuple[float, float]:

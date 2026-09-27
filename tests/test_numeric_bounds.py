@@ -1,7 +1,9 @@
 """数值边界测试：NaN/±Infinity 拒绝、时点 UTC 可转换性、偏差溢出与事务原子性。
 
 覆盖 POST /observations、PUT /observations/{id} 与
-POST /observation-impact-preview 三个共用观测输入的入口。
+POST /observation-impact-preview 三个共用观测输入的入口，以及
+POST /corrections、POST /correction-receipts 与 GET /historical-correction
+三个漂移补偿入口的极端数值边界（插值中间溢出、最终校正值溢出）。
 """
 from __future__ import annotations
 
@@ -420,3 +422,176 @@ def test_finite_median_does_not_overflow_for_equal_extremes():
     assert finite_median([1e308, 1e308, 1e308, 1e308]) == 1e308
     assert finite_median([-1e308, -1e308, -1e308, -1e308]) == -1e308
     assert math.isfinite(finite_median([1e308, 1e308]))
+
+
+# ---------- 漂移补偿入口：/corrections、/correction-receipts、/historical-correction ----------
+
+@pytest.fixture()
+def extreme_points(client):
+    """两端观测偏差分别为 +1e308 与 -1e308（reference=0，读数取反得到偏差）。"""
+    big = 1e308
+    make_observation(client, ts=1000.0, reference=0.0, tolerance=0.0,
+                     readings=[-big, -big, -big])   # bias = 0 - (-1e308) = 1e308
+    make_observation(client, ts=2000.0, reference=0.0, tolerance=0.0,
+                     readings=[big, big, big])       # bias = 0 - 1e308 = -1e308
+    return client
+
+
+def test_correction_interpolates_opposite_extreme_biases_without_overflow(extreme_points):
+    # 两端偏差 1e308 与 -1e308：直接 (b1-b0) 会先溢出，中点必须仍得到有限的 0.0
+    resp = extreme_points.post("/corrections",
+                               json={"timestamp": 1500.0, "reading": 0.0})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["bias"] == pytest.approx(0.0)
+    assert math.isfinite(body["bias"])
+    assert body["corrected"] == pytest.approx(0.0)
+    # 观测点与区间端点保持原偏差，不做任何缩放
+    assert body["interval"]["bias_start"] == pytest.approx(1e308)
+    assert body["interval"]["bias_end"] == pytest.approx(-1e308)
+
+
+def test_correction_keeps_original_bias_at_extreme_endpoints(extreme_points):
+    resp_lo = extreme_points.post("/corrections",
+                                  json={"timestamp": 1000.0, "reading": 0.0})
+    assert resp_lo.status_code == 200, resp_lo.text
+    assert resp_lo.json()["bias"] == pytest.approx(1e308)
+    assert resp_lo.json()["interval"] is None
+
+    resp_hi = extreme_points.post("/corrections",
+                                  json={"timestamp": 2000.0, "reading": 0.0})
+    assert resp_hi.status_code == 200, resp_hi.text
+    assert resp_hi.json()["bias"] == pytest.approx(-1e308)
+
+
+def test_correction_rejects_when_corrected_value_overflows(extreme_points):
+    # 读数 1e308 叠加观测点偏差 1e308 → 2e308 超出 float 上界：422
+    resp = extreme_points.post("/corrections",
+                               json={"timestamp": 1000.0, "reading": 1e308})
+    assert resp.status_code == 422
+    assert "overflows" in resp.json()["detail"]
+
+
+def test_correction_rejects_interior_corrected_overflow(extreme_points):
+    # w=0.25 处偏差 5e307，读数 1e308 叠加为 1.5e308，仍可表示
+    ok = extreme_points.post("/corrections",
+                             json={"timestamp": 1250.0, "reading": 1e308})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["corrected"] == pytest.approx(1.5e308)
+
+    # w=0.1 处偏差 8e307，读数 1e308 叠加为 1.8e308（大于 DBL_MAX ≈ 1.7977e308）→ 溢出
+    bad = extreme_points.post("/corrections",
+                              json={"timestamp": 1100.0, "reading": 1e308})
+    assert bad.status_code == 422, bad.text
+    assert "overflows" in bad.json()["detail"]
+
+
+@pytest.mark.parametrize("bad", NON_FINITE)
+def test_correction_rejects_non_finite_reading(extreme_points, bad):
+    resp = post_json(extreme_points, "/corrections",
+                     {"timestamp": 1500.0, "reading": bad})
+    assert resp.status_code == 422
+    # 422 响应体必须仍是合法 JSON（NaN 回显不允许导致 500）
+    assert isinstance(json.loads(resp.text)["detail"], list)
+
+
+def test_correction_outside_coverage_still_returns_400(extreme_points):
+    # 覆盖范围外的 400 判定不受数值边界改动影响
+    resp = extreme_points.post("/corrections",
+                               json={"timestamp": 42.0, "reading": 1e308})
+    assert resp.status_code == 400
+    assert "outside calibration coverage" in resp.json()["detail"]
+
+
+def test_receipt_issue_accepts_huge_finite_interpolated_correction(extreme_points):
+    # 中点偏差为 0：读数 1e308 的校正值仍为 1e308，可以正常签发回执
+    resp = extreme_points.post("/correction-receipts",
+                               json={"timestamp": 1500.0, "reading": 1e308})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["version"] == 2
+    assert body["bias"] == pytest.approx(0.0)
+    assert body["corrected"] == pytest.approx(1e308)
+    # 回执签名仍为 64 位小写十六进制（既有签名格式不变）
+    assert len(body["receipt"]) == 64
+    assert body["receipt"] == body["receipt"].lower()
+    assert extreme_points.post("/correction-receipts/verify",
+                               json=body).json() == {"valid": True}
+
+
+def test_receipt_not_issued_when_corrected_value_overflows(extreme_points):
+    # 最终校正值不可表示时返回 422，且不签发回执（无 receipt 字段、无副作用）
+    resp = extreme_points.post("/correction-receipts",
+                               json={"timestamp": 1000.0, "reading": 1e308})
+    assert resp.status_code == 422
+    assert "receipt" not in resp.json()
+    assert table_counts(extreme_points) == (2, 6, 1, 0)
+
+
+@pytest.mark.parametrize("bad", NON_FINITE)
+def test_receipt_rejects_non_finite_reading(extreme_points, bad):
+    resp = post_json(extreme_points, "/correction-receipts",
+                     {"timestamp": 1500.0, "reading": bad})
+    assert resp.status_code == 422
+    assert "receipt" not in resp.json()
+
+
+def test_historical_correction_interpolates_extremes_without_overflow(extreme_points):
+    resp = extreme_points.get(
+        "/historical-correction",
+        params={"effective_at": 1500.0, "as_of": 2000000000.0, "reading": 0.0},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert math.isfinite(body["bias"])
+    assert body["bias"] == pytest.approx(0.0)
+    assert body["corrected"] == pytest.approx(0.0)
+    assert body["endpoints"][0]["bias"] == pytest.approx(1e308)
+    assert body["endpoints"][1]["bias"] == pytest.approx(-1e308)
+
+
+def test_historical_correction_rejects_corrected_overflow(extreme_points):
+    resp = extreme_points.get(
+        "/historical-correction",
+        params={"effective_at": 1000.0, "as_of": 2000000000.0, "reading": 1e308},
+    )
+    assert resp.status_code == 422
+    assert "overflows" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize("bad", ("nan", "inf", "-inf"))
+def test_historical_correction_rejects_non_finite_reading(extreme_points, bad):
+    resp = extreme_points.get(
+        "/historical-correction",
+        params={"effective_at": 1500.0, "as_of": 2000000000.0, "reading": bad},
+    )
+    assert resp.status_code == 422
+
+
+def test_historical_correction_outside_coverage_still_returns_400(extreme_points):
+    resp = extreme_points.get(
+        "/historical-correction",
+        params={"effective_at": 42.0, "as_of": 2000000000.0, "reading": 1e308},
+    )
+    assert resp.status_code == 400
+    assert "outside calibration coverage" in resp.json()["detail"]
+
+
+def test_interpolate_midpoint_form_matches_linear_form_for_ordinary_values():
+    from app.calibration import interpolate
+
+    def linear(t, t0, b0, t1, b1):
+        return b0 + (b1 - b0) * (t - t0) / (t1 - t0)
+
+    # 线性形式仍可表示的常规量级：两种写法结果一致
+    args = [
+        (1500.0, 1000.0, 1.0, 2000.0, 3.0),
+        (1250.0, 1000.0, -5.0, 2000.0, 5.0),
+        (1750.0, 1000.0, 1e100, 2000.0, 2e100),
+    ]
+    for a in args:
+        assert interpolate(*a) == pytest.approx(linear(*a))
+
+    # 极端异号端点：线性形式在差值处溢出（-inf），凸组合形式仍给出有限中点
+    assert not math.isfinite(linear(1500.0, 1000.0, 1e308, 2000.0, -1e308))
+    assert interpolate(1500.0, 1000.0, 1e308, 2000.0, -1e308) == 0.0

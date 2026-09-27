@@ -5,7 +5,22 @@ import math
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
-from pydantic import BaseModel, BeforeValidator, Field, field_validator
+from pydantic import AfterValidator, BaseModel, BeforeValidator, Field, field_validator
+
+
+def _must_be_finite(value: float) -> float:
+    """数值字段必须有限：NaN/±Infinity 一律拒绝（422）。
+
+    待校正读数为 NaN/±Infinity 时无法参与漂移补偿（与偏差相加只会得到
+    NaN/Infinity，响应与回执都无法表示），在入口模型层直接拒绝。
+    """
+    if not math.isfinite(value):
+        raise ValueError("must be a finite number (NaN and Infinity are not allowed)")
+    return value
+
+
+# 待校正读数：先经 float 强转，再拒绝 NaN/±Infinity
+FiniteFloat = Annotated[float, AfterValidator(_must_be_finite)]
 
 
 def epoch_to_iso(ts: float) -> str:
@@ -84,7 +99,7 @@ class ObservationIn(BaseModel):
 
 class CorrectionIn(BaseModel):
     timestamp: Timestamp = Field(description="待校正读数的时点：Unix 秒或 ISO 8601")
-    reading: float = Field(description="待校正的原始读数")
+    reading: FiniteFloat = Field(description="待校正的原始读数（必须为有限数值）")
 
 
 class ObservationReviseIn(ObservationIn):

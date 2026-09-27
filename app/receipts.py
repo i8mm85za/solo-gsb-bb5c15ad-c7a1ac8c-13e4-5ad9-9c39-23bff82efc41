@@ -25,7 +25,7 @@ import time
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import receipt_keys, service
-from .models import Timestamp
+from .models import FiniteFloat, Timestamp
 
 RECEIPT_VERSION = 2
 LEGACY_RECEIPT_VERSION = 1
@@ -107,7 +107,7 @@ def sign_legacy(
 
 class CorrectionReceiptIn(BaseModel):
     timestamp: Timestamp = Field(description="待校正读数的时点：Unix 秒或 ISO 8601")
-    reading: float = Field(description="待校正的原始读数")
+    reading: FiniteFloat = Field(description="待校正的原始读数（必须为有限数值）")
 
 
 class CorrectionRequestOut(BaseModel):

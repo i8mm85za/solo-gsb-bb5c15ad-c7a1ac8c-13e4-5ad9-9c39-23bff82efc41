@@ -8,6 +8,7 @@ import time
 from contextlib import closing
 
 from . import calibration
+from .calibration import CalibrationError
 from .db import connect
 from .models import epoch_to_iso
 
@@ -334,6 +335,27 @@ def _interval_dict(row: sqlite3.Row) -> dict:
 
 # ---------- 漂移补偿 ----------
 
+def _apply_bias(reading: float, bias: float) -> float:
+    """待校正读数叠加插值偏差：读数或最终校正值不可表示时拒绝（422）。
+
+    /corrections、/historical-correction 与 /correction-receipts 共用此计算。
+    偏差插值本身已用不溢出的凸组合形式（见 calibration.interpolate），观测点与
+    区间端点保持原偏差；但读数可能为 NaN/±Infinity（如 GET 查询参数），或两个
+    有限数同号相加超出 float 上界（如读数 1e308 叠加偏差 1e308 → Infinity）。
+    非有限结果无法 JSON 表示、回执也不应为其签名，故在此统一拦截。
+    """
+    if not math.isfinite(reading):
+        raise CalibrationError("reading must be a finite number (NaN and Infinity are not allowed)")
+    corrected = reading + bias
+    if not math.isfinite(corrected):
+        # 读数与偏差均有限，但二者之和溢出为 ±Infinity：最终校正值不可表示
+        raise CalibrationError(
+            "corrected value overflows to a non-finite value "
+            "(reading and drift bias are too far apart)"
+        )
+    return corrected
+
+
 def correct(ts: float, reading: float) -> dict:
     """对待校正读数施加所在时点的插值偏差，返回校正结果与区间、异常明细。"""
     with closing(connect()) as conn:
@@ -361,7 +383,7 @@ def correct(ts: float, reading: float) -> dict:
             "timestamp_iso": epoch_to_iso(ts),
             "reading": reading,
             "bias": bias,
-            "corrected": reading + bias,
+            "corrected": _apply_bias(reading, bias),
             "interval": interval,
             "endpoints": [_endpoint_dict(conn, ob) for ob in endpoints],
         }
@@ -453,7 +475,7 @@ def historical_correct(effective_at: float, as_of: float, reading: float) -> dic
         "as_of_iso": epoch_to_iso(as_of),
         "reading": reading,
         "bias": bias,
-        "corrected": reading + bias,
+        "corrected": _apply_bias(reading, bias),
         "interval": interval,
         "endpoints": [
             {
