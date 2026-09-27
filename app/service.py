@@ -361,7 +361,7 @@ def correct(ts: float, reading: float) -> dict:
             "timestamp_iso": epoch_to_iso(ts),
             "reading": reading,
             "bias": bias,
-            "corrected": reading + bias,
+            "corrected": calibration.correct_reading(reading, bias),
             "interval": interval,
             "endpoints": [_endpoint_dict(conn, ob) for ob in endpoints],
         }
@@ -453,7 +453,7 @@ def historical_correct(effective_at: float, as_of: float, reading: float) -> dic
         "as_of_iso": epoch_to_iso(as_of),
         "reading": reading,
         "bias": bias,
-        "corrected": reading + bias,
+        "corrected": calibration.correct_reading(reading, bias),
         "interval": interval,
         "endpoints": [
             {

@@ -77,10 +77,47 @@ def compute_bias(reference: float, tolerance: float, readings: list[float]) -> t
 
 
 def interpolate(t: float, t0: float, b0: float, t1: float, b1: float) -> float:
-    """在相邻时点 (t0, b0) 与 (t1, b1) 之间对 t 做线性插值。"""
-    if t1 == t0:
+    """在相邻时点 (t0, b0) 与 (t1, b1) 之间对 t 做线性插值（t ∈ [t0, t1]）。
+
+    两端偏差均为有限值时，直接式 b0 + (b1−b0)·w 仍可能在中间步骤溢出为
+    ±Infinity：除 b1−b0 本身溢出（两端异号且均接近 float 上界，如 1e308 与
+    -1e308）外，有限的 b1−b0 再乘 w 也可能溢出（如 b0≈2.4e307、b1≈0、w≈0.68，
+    乘积超过 float 上界），两种情况都会把本可表示的插值算成 Infinity。
+    此时改走凸组合 b0·(1−w) + b1·w——它是两端的凸组合，真解必落在两端之间；
+    若凸组合因中间项舍入（如 1−w 舍成 1）仍溢出，则钳到对应端点。直接式本身
+    有限时沿用之，结果与既有实现逐位一致。w=0/1 即观测点与区间端点，直接
+    返回 b0/b1，始终保持原偏差。
+    """
+    if t == t0 or t1 == t0:
         return b0
-    return b0 + (b1 - b0) * (t - t0) / (t1 - t0)
+    if t == t1:
+        return b1
+    w = (t - t0) / (t1 - t0)
+    direct = b0 + (b1 - b0) * w
+    if math.isfinite(direct):
+        return direct
+    convex = b0 * (1.0 - w) + b1 * w
+    if math.isfinite(convex):
+        return convex
+    # 凸组合中间项舍入（1−w→1 等）仍溢出：真解在两端之间，钳到越界方向的端点
+    return max(b0, b1) if convex == math.inf else min(b0, b1)
+
+
+def correct_reading(reading: float, bias: float) -> float:
+    """校正读数 = 原始读数 + 插值偏差；结果不可表示时拒绝。
+
+    读数与偏差均为有限值时，二者之和仍可能溢出为 ±Infinity（如读数 1e308、
+    偏差 1e308）。非有限校正值既无法作为合法 JSON 响应，也不能纳入回执签名
+    载荷（否则签发与所见不一致），故抛 CalibrationError 由入口返回 422，
+    /correction-receipts 在该异常下不签发回执。
+    """
+    corrected = reading + bias
+    if not math.isfinite(corrected):
+        raise CalibrationError(
+            "corrected value overflows to a non-finite value "
+            "(reading and drift bias are too far apart)"
+        )
+    return corrected
 
 
 def integrate_segment(t0: float, b0: float, t1: float, b1: float) -> tuple[float, float]:

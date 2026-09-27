@@ -26,6 +26,7 @@ from .models import (
     DriftExceedancesOut,
     DriftIntegralOut,
     DriftStabilityWindowOut,
+    FiniteFloat,
     HistoricalCorrectionOut,
     IntervalOut,
     ObservationImpactPreviewIn,
@@ -194,11 +195,17 @@ def get_intervals() -> list[dict]:
 
 @app.post("/corrections", response_model=CorrectionOut)
 def post_correction(payload: CorrectionIn) -> dict:
-    """对指定时点的读数做漂移补偿；覆盖范围外拒绝。"""
+    """对指定时点的读数做漂移补偿；覆盖范围外拒绝。
+
+    读数为 NaN/±Infinity（入口 422）或最终校正值溢出为非有限值（422）时
+    都不返回校正结果；覆盖范围外仍为 400。
+    """
     try:
         return service.correct(ts=payload.timestamp, reading=payload.reading)
     except OutOfCoverageError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CalibrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/correction-receipts", response_model=CorrectionReceiptOut)
@@ -209,12 +216,15 @@ def post_correction_receipt(payload: CorrectionReceiptIn) -> dict:
     归一化请求（timestamp 统一为 Unix 秒）、bias、corrected、UTC Unix 毫秒整数
     issued_at，以及对 [version,key_id,timestamp,reading,bias,corrected,issued_at]
     做 HMAC-SHA256（密钥取自 CORRECTION_RECEIPT_KEYS 键环中 key_id 对应的密钥）
-    得到的小写十六进制 receipt。覆盖范围外与 /corrections 一样返回 400。
+    得到的小写十六进制 receipt。覆盖范围外与 /corrections 一样返回 400；读数
+    非有限或最终校正值不可表示时返回 422，且不签发任何回执。
     """
     try:
         return receipts.issue_receipt(ts=payload.timestamp, reading=payload.reading)
     except OutOfCoverageError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CalibrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/correction-receipts/verify", response_model=CorrectionReceiptVerifyOut)
@@ -236,7 +246,7 @@ def post_correction_receipt_verify(payload: CorrectionReceiptVerifyIn) -> dict:
 def get_historical_correction(
     effective_at: Annotated[Timestamp, Query(description="目标观测时点：Unix 秒或 ISO 8601")],
     as_of: Annotated[Timestamp, Query(description="系统时点：重建该时刻可见的校准状态，Unix 秒或 ISO 8601")],
-    reading: Annotated[float, Query(description="待校正的原始读数")],
+    reading: Annotated[FiniteFloat, Query(description="待校正的原始读数（必须为有限数值）")],
 ) -> dict:
     """按 as_of 系统时点重建校准状态，对 effective_at 时点的读数做漂移补偿。
 
@@ -244,12 +254,15 @@ def get_historical_correction(
     尚未创建的观测不参与，修订自 changed_at 起生效（恰等于变更时刻用新版本）；
     随后按重建出的观测时点排序，沿用与 /corrections 相同的覆盖范围与线性插值
     规则。查询只读，不改写观测、修订历史或区间表；响应附带 as_of 及所用端点
-    的观测 ID 与版本。
+    的观测 ID 与版本。读数为 NaN/±Infinity（入口 422）或最终校正值溢出为
+    非有限值（422）时不返回校正结果；覆盖范围外仍为 400。
     """
     try:
         return service.historical_correct(effective_at=effective_at, as_of=as_of, reading=reading)
     except OutOfCoverageError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CalibrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/drift-integral", response_model=DriftIntegralOut)

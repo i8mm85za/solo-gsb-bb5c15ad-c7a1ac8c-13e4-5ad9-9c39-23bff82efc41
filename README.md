@@ -4,15 +4,20 @@
 
 ## 快速开始（单条命令）
 
+需要安装 Docker 与 Docker Compose（v2，`docker compose` 子命令）。仓库自带可用的 `Dockerfile` 与 `docker-compose.yml`，无需任何额外文件，构建镜像、装依赖、建库并在容器内启动服务只需一条命令：
+
 ```bash
 docker compose up --build
 ```
 
+- 服务监听容器内 **8000 端口**，Compose 将其映射到宿主机 **8000 端口**（`ports: "8000:8000"`）；如本机 8000 已被占用，可改为 `"8001:8000"` 之类的映射，容器内端口保持 8000 不变。
 - **API 地址：http://localhost:8000**
 - 交互式文档（Swagger UI）：http://localhost:8000/docs
 - 健康检查：http://localhost:8000/health
 
 SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.db`），容器重启数据不丢。
+
+必要配置均通过 Compose 的**环境变量**提供（见下文「环境变量」）：`CALIB_DB_PATH` 在 Compose 中固定为 `/data/calibration.db`；`CORRECTION_RECEIPT_KEYS` / `CORRECTION_RECEIPT_ACTIVE_KEY` / `CORRECTION_RECEIPT_SECRET` 未在宿主机设置时使用仅供本地开发的内置默认值，**生产部署必须覆盖回执密钥**（无需修改 Compose 文件，直接在命令前注入环境变量即可，示例见「环境变量」一节）。
 
 ## 输入边界（有限数值与时点）
 
@@ -25,12 +30,19 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 - 被 422 拒绝的创建或修订不会留下任何观测、读数、区间或修订快照的变化（全部校验与计算在写入前/单事务内完成）；影响预演始终只读。
 - 异常读数判定规则不变：读数偏离该组中位数超过 `tolerance` 即标记为异常。
 
+`POST /corrections`、`GET /historical-correction` 与 `POST /correction-receipts` 共用同一套漂移补偿计算（覆盖范围判定、线性插值、校正值求和）与读数入口校验，其边界规则一致：
+
+- **待校正读数 `reading`** 必须是**有限**数值；请求体或查询参数中的 `NaN`、`Infinity`、`-Infinity`（含 `nan`/`inf` 等大小写变体的查询字符串）一律返回 **422**。读数非法时回执接口**不签发回执**。
+- **插值防溢出**：两端偏差均为有限值时，朴素式 `b0 + (b1−b0)·w` 仍可能在中间步骤溢出为 ±Infinity——`b1−b0` 本身可溢出（两端异号且均接近 float 上界，如 `1e308` 与 `-1e308`），有限的 `b1−b0` 再乘 `w` 也可溢出（如差约 `2.4e307`、`w≈0.68`），都会把本可表示的插值算成 Infinity。插值先按朴素式计算，仅在其结果非有限时改走两端凸组合 `b0·(1−w) + b1·w`（真解必落在两端之间），凸组合因中间项舍入仍溢出时钳到对应端点；朴素式本身有限时与原实现**逐位一致**。**观测点与区间端点始终保持原偏差**（`t` 恰为端点时直接返回 `b0`/`b1`）。
+- **校正值不可表示**：读数与偏差均为有限值，但 `校正读数 = 读数 + 偏差` 溢出为 ±Infinity（如读数 `1e308`、偏差 `1e308`）时返回 **422**（响应含 “overflows” 说明），回执接口同样 422 且**不签发回执**；只要和可表示（如读数 `-5e307` 加偏差 `1e308` 得 `5e307`）即正常返回。
+- **覆盖范围优先**：查询时点越出 `[最早观测, 最晚观测]`（历史补偿按 `as_of` 重建后的范围判定）仍返回 **400**；400 与读数 422 是两条独立规则。
+
 ## 校准规则
 
 1. **观测登记**：每次提交参考值 `reference`（有限数值）、容差 `tolerance`（有限非负数）、同一时点 `timestamp`（须能转换为 UTC 日期）的至少 3 次**有限数值**读数。`NaN`/±`Infinity` 及无法转换为 UTC 日期的时点返回 422；有限输入算出的偏差溢出时同样 422。
 2. **异常判定**：读数偏离该组**中位数**超过 `tolerance` 即标记为异常（原始读数仍完整保留）。
 3. **校准偏差**：`bias = reference − 有效读数（剔除异常后）的中位数`。
-4. **漂移补偿**：在相邻观测时点间对 `bias` 做**线性插值**，`校正读数 = 原始读数 + 插值偏差`。
+4. **漂移补偿**：在相邻观测时点间对 `bias` 做**线性插值**，`校正读数 = 原始读数 + 插值偏差`。朴素插值在两端偏差均接近 float 上界时可能因中间步骤（求端点差或差再乘权重）溢出为 ±Infinity；插值仅在朴素结果非有限时回退到两端凸组合（仍溢出则钳到对应端点）——只要真解可表示（如 `1e308` 与 `-1e308` 的中点 `0.0`）就返回有限值，朴素式有限时与原实现逐位一致，观测点与区间端点保持原偏差。`待校正读数` 为 `NaN`/±`Infinity`，或最终校正值溢出为 ±Infinity 时，`/corrections`、`/historical-correction` 与 `/correction-receipts` 一律返回 422，后者不签发回执。
 5. **区间重算**：新增/修订观测只重算受影响的相邻区间（原位置缺口重新接通、新位置区间被时点拆分），其余历史区间与原始数据不变。
 6. **覆盖范围**：查询时点超出 `[最早观测, 最晚观测]` 时拒绝（HTTP 400）；恰落在观测点上时直接使用该点偏差。
 7. **修订与版本**：观测带单调递增的 `revision`（新建为 1）。`PUT` 修订须携带当前 `revision`，版本过期或目标时点已被占用均返回 409；成功后观测 ID 不变、版本 +1，并保存一份修订前快照（旧输入与旧偏差），可通过修订历史接口按版本倒序查询。
@@ -40,7 +52,7 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 11. **漂移稳定窗口分析**：`GET /drift-stability-window?from=&to=&max_spread=` 在覆盖范围内**解析求出** `max(bias) − min(bias) ≤ max_spread` 的持续时间最长的连续子区间：最优窗口必是某临界带宽 `[m, m+max_spread]` 的连通分量（`m` 取遍折点取值及其下移 `max_spread` 的值），分量边界由线性段与带宽边缘的解析交点精确定位，可落在插值段内部，不做固定步长采样；时长并列时返回起点最早者。响应含起止时刻、`duration_seconds` 与窗口内实际达到的 `min_bias`/`max_bias`。`from` 必须小于 `to`、`max_spread` 必须为正数，任一边界越界返回 400。
 12. **历史时点漂移补偿**：`GET /historical-correction?effective_at=&as_of=&reading=` 按 `as_of` 系统时点重建校准状态后，对目标观测时点 `effective_at` 的读数做漂移补偿。重建依据 `observations.created_at`、当前版本与 `revisions` 快照：`created_at > as_of` 的观测尚未创建、不参与；修订自 `changed_at` 起生效（恰等于 `changed_at` 时使用新版本），`changed_at > as_of` 的修订一律回滚到快照旧值。随后按重建出的观测时点排序，沿用与 `/corrections` 相同的覆盖范围与线性插值规则。查询**只读**，不改写当前观测、修订历史或区间表；响应附带 `as_of` 及所用端点的观测 ID 与版本。
 13. **观测影响预演**：`POST /observation-impact-preview` 接收一条**不落库**的候选观测与正数 `impact_limit`，沿用现有异常判定算出候选偏差，预演插入对当前分段线性偏差曲线的影响。仅在候选时点两侧都已有观测时预演（候选时点已占用或无法形成双侧邻点均返回 409）：插入只会把左右最近观测之间的区间重新分段，受影响范围即 `[prev, next]`；曲线变化量 Δ 是折点 `(prev, 0) → (候选, Δc) → (next, 0)` 的分段线性函数，返回受影响时间范围、最大绝对偏差变化及其最早发生时点，以及 `|Δ| > impact_limit` 的连续区间（阈值交点解析求解，恰等于阈值的瞬时不计入，不做固定步长采样）。请求**只读**，不改写观测、修订历史或区间表。
-14. **校正回执与密钥轮换**：`POST /correction-receipts` 复用 `/corrections` 的漂移补偿，并以键环当前活跃键签发 `version=2` 的 HMAC 回执：返回 `version`、`key_id`（签发密钥 ID）、归一化请求（`timestamp` 统一为 Unix 秒）、`bias`、`corrected`、`issued_at`（UTC Unix 毫秒整数）与 `receipt`。签名载荷按 `version`、`key_id`、`timestamp`、`reading`、`bias`、`corrected`、`issued_at` 顺序组成 JSON 数组，数值取 JSON 最短十进制、UTF-8 编码且无任何空白，以 `CORRECTION_RECEIPT_KEYS` 键环中 `key_id` 对应的密钥计算 HMAC-SHA256，输出小写十六进制。`POST /correction-receipts/verify` 接收完整回执，按 `key_id` **精确选键**重算签名并以**常量时间**比较：任一签名字段被改动、或 `key_id` 未知/已轮换出环均返回 `{"valid": false}`（旧键保留在环内时，轮换前签发的回执仍可验证）；结构缺失或类型错误返回 422。历史 `version=1` 回执继续按旧规则校验（密钥取自 `CORRECTION_RECEIPT_SECRET`，载荷不含 `key_id`）。键环在启动时校验：空键环、未知活跃键、非法 `key_id` 一律拒绝启动。
+14. **校正回执与密钥轮换**：`POST /correction-receipts` 复用 `/corrections` 的漂移补偿，并以键环当前活跃键签发 `version=2` 的 HMAC 回执：返回 `version`、`key_id`（签发密钥 ID）、归一化请求（`timestamp` 统一为 Unix 秒）、`bias`、`corrected`、`issued_at`（UTC Unix 毫秒整数）与 `receipt`。待校正读数为 `NaN`/±`Infinity`、或最终校正值溢出为非有限值时返回 **422 且不签发回执**（覆盖范围外仍为 400）。签名载荷按 `version`、`key_id`、`timestamp`、`reading`、`bias`、`corrected`、`issued_at` 顺序组成 JSON 数组，数值取 JSON 最短十进制、UTF-8 编码且无任何空白，以 `CORRECTION_RECEIPT_KEYS` 键环中 `key_id` 对应的密钥计算 HMAC-SHA256，输出小写十六进制。`POST /correction-receipts/verify` 接收完整回执，按 `key_id` **精确选键**重算签名并以**常量时间**比较：任一签名字段被改动、或 `key_id` 未知/已轮换出环均返回 `{"valid": false}`（旧键保留在环内时，轮换前签发的回执仍可验证）；结构缺失或类型错误返回 422。历史 `version=1` 回执继续按旧规则校验（密钥取自 `CORRECTION_RECEIPT_SECRET`，载荷不含 `key_id`）。键环在启动时校验：空键环、未知活跃键、非法 `key_id` 一律拒绝启动。
 15. **校准排期规划**：`POST /calibration-schedules/plan` 在 `[from, to]` 窗口内规划**数量最少**的新增校准时点。固定锚点取窗口两侧能覆盖边界的现有观测（`from` 之前最近一次、`to` 之后最近一次，恰落在边界上的观测自然入选）与窗口内全部观测；在禁排时段之外插入最少的新增时点，使所有相邻锚点（含新增时点）的间隔都不超过 `max_gap`。禁排时段先**规范化合并**（丢弃空区间、排序、合并重叠或端点相接的区间），合并后区间的**开区间内部**禁止排期、**边界允许排期**；多个最少方案并列时返回**字典序最早**的一组。响应含规范化后的禁排时段、固定锚点、建议时点与逐段间隔。请求**只读**，不改写观测、修订历史或区间表；缺少覆盖边界的现有锚点或约束无解返回 409，`from ≥ to`、`max_gap ≤ 0` 或禁排区间 `from > to` 返回 400。
 16. **校准曲线精简**：`POST /calibration-curves/simplify` 从当前观测（按时点排序）中**仅选择原观测的一个子序列**，首尾观测必须保留，使相邻保留点线性插值得到的精简曲线在完整覆盖范围内与原曲线的**绝对偏差逐原观测折点核对均不超过** `max_error`，并使**保留点数全局最少**（在可行弦 DAG 上做最短路）；保留点数并列时选择**时点序列字典序最早**者。每条候选弦的可行性都要逐一核对它跨越的**每个原观测折点**（不做固定步长采样，也不只查弦端点——端点偏差恒为 0）；全局实际最大误差同样由逐折点偏差取最大值得到（段内两条折线之差是线性函数，最大值必在折点），并列时取最早发生时点。响应返回保留点的 ID、时点、偏差（精简曲线经过原观测点，保留点偏差恒为 0），以及全局实际最大误差与其最早发生时点。请求**只读**，原观测、修订历史与区间表均不改写；`max_error` 必须是有限非负数（`0` 合法），否则返回 **422**；当前观测不足两条返回 **409**。
 
@@ -205,9 +217,11 @@ curl -X POST http://localhost:8000/corrections \
 }
 ```
 
+数值边界（与 `/historical-correction`、`/correction-receipts` 完全一致）：`reading` 必须是有限数值，`NaN`/±`Infinity` 返回 422；两端偏差即使都在 float 上界附近（如 `1e308` 与 `-1e308`，或有限差值乘权重仍溢出的组合），插值也会回退到不发生中间溢出的凸组合，中点仍返回有限的 `0.0`（区间与响应中的端点偏差保持各自的原值）；读数与偏差均有限但二者之和不可表示（如 `1e308 + 1e308`）时返回 422。覆盖范围外仍为 400。
+
 ### 校正回执（HMAC 签名与密钥轮换）
 
-`POST /correction-receipts` 的请求体与 `/corrections` 相同，内部**完全复用**漂移补偿（同样的覆盖范围判定与线性插值，越界返回 400），但只回传校正结果与一份可离线校验的签名回执，不携带区间/端点明细：
+`POST /correction-receipts` 的请求体与 `/corrections` 相同，内部**完全复用**漂移补偿（同样的覆盖范围判定与线性插值，越界返回 400），但只回传校正结果与一份可离线校验的签名回执，不携带区间/端点明细。读数为 `NaN`/±`Infinity`、或最终校正值溢出为非有限值时返回 **422 且不签发回执**（响应只有 `detail`，不含 `receipt`）：
 
 ```bash
 curl -X POST http://localhost:8000/correction-receipts \
@@ -329,7 +343,7 @@ curl "http://localhost:8000/historical-correction?effective_at=2026-09-18T09:00:
 }
 ```
 
-`effective_at` 越出重建后的覆盖范围（含 `as_of` 时无任何观测）时返回 400；恰落在重建后的观测点上时直接使用该点偏差（`interval` 为 `null`）。
+`effective_at` 越出重建后的覆盖范围（含 `as_of` 时无任何观测）时返回 400；恰落在重建后的观测点上时直接使用该点偏差（`interval` 为 `null`）。`reading` 为 `NaN`/±`Infinity`（查询参数 `nan`/`inf` 等写法同理）或重建偏差与读数之和不可表示时返回 422；两端偏差在极端量级下的中点插值同样走防溢出计算，结果可表示时保持有限。
 
 ### 累计漂移量积分
 
@@ -539,10 +553,10 @@ curl -X POST http://localhost:8000/calibration-curves/simplify \
 
 | 状态码 | 场景 |
 | --- | --- |
-| 400 | 查询时点超出校准覆盖范围（响应含可用区间；历史补偿按重建后的覆盖范围判定）；积分/超限/稳定窗口 `from ≥ to` 或任一边界越界；超限阈值 `limit ≤ 0`；稳定窗口 `max_spread ≤ 0`；预算耗尽起点 `from` 越界或 `budget ≤ 0`；影响预演 `impact_limit ≤ 0`；排期规划 `from ≥ to`、`max_gap ≤ 0` 或禁排区间 `from > to` |
+| 400 | 查询时点超出校准覆盖范围（响应含可用区间；历史补偿按重建后的覆盖范围判定，漂移补偿三端一致）；积分/超限/稳定窗口 `from ≥ to` 或任一边界越界；超限阈值 `limit ≤ 0`；稳定窗口 `max_spread ≤ 0`；预算耗尽起点 `from` 越界或 `budget ≤ 0`；影响预演 `impact_limit ≤ 0`；排期规划 `from ≥ to`、`max_gap ≤ 0` 或禁排区间 `from > to` |
 | 404 | 修订/查询修订历史时观测 ID 不存在 |
 | 409 | 同一时点重复登记观测；修订时版本过期或目标时点已被占用；影响预演候选时点已占用或两侧无法形成邻点；排期规划缺少覆盖边界的现有锚点或禁排约束下无解；曲线精简时当前观测不足两条 |
-| 422 | 读数不足 3 次、全部读数被判异常、参数非法；观测输入（时点/参考值/容差/读数）出现 `NaN`/±`Infinity`、时点无法转换为 UTC 日期，或有限输入算出的偏差/影响变化溢出为非有限值；曲线精简 `max_error` 非有限非负数/类型错误/缺失；回执校验请求结构缺失或字段类型错误（含 version=2 缺 `key_id`） |
+| 422 | 读数不足 3 次、全部读数被判异常、参数非法；观测输入（时点/参考值/容差/读数）出现 `NaN`/±`Infinity`、时点无法转换为 UTC 日期，或有限输入算出的偏差/影响变化溢出为非有限值；漂移补偿三端（`/corrections`、`/historical-correction`、`/correction-receipts`）的待校正读数为 `NaN`/±`Infinity`，或最终校正值（读数 + 插值偏差）溢出为非有限值——回执接口此时不签发回执；曲线精简 `max_error` 非有限非负数/类型错误/缺失；回执校验请求结构缺失或字段类型错误（含 version=2 缺 `key_id`） |
 
 ## 本地开发
 
@@ -580,6 +594,7 @@ app/
   db.py           # SQLite 连接与建表
 tests/test_api.py                            # 端到端 API 测试
 tests/test_numeric_bounds.py                 # 数值边界测试：NaN/±Infinity 拒绝、时点 UTC 可转换性、偏差溢出与事务原子性
+tests/test_correction_numeric_bounds.py      # 漂移补偿三端数值边界：极端偏差插值防溢出、读数/校正值非有限 422、回执不签发
 tests/test_correction_receipts.py            # 校正回执签发/校验/密钥轮换/v1 兼容端到端测试
 tests/test_receipt_keys.py                   # 键环加载与启动校验测试
 tests/test_schedule_plan.py                  # 排期规划纯算法单测（禁排合并、最少时点、字典序最早、无解判定）

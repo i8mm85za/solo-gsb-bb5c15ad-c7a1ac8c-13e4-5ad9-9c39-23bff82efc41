@@ -53,6 +53,36 @@ def parse_timestamp(value: Any) -> float:
 Timestamp = Annotated[float, BeforeValidator(parse_timestamp)]
 
 
+def _parse_finite_float(value: Any) -> float:
+    """漂移补偿读数入口：接受数值（及 Pydantic 宽松模式下的数字字符串），
+    拒绝 NaN/±Infinity 与非数值类型。
+
+    非有限读数无法给出有意义的校正结果：在入口（/corrections、
+    /correction-receipts 的请求体与 /historical-correction 的查询参数）统一
+    拒绝为 422，避免 NaN/Infinity 透传到补偿计算或回执签名。宽松数值强转
+    （布尔、数字字符串）与 Pydantic 普通 float 字段保持一致；严格模式的
+    回执校验模型另有 ConfigDict(strict=True) 拒收布尔冒充。
+    """
+    if isinstance(value, bool):
+        number = float(value)  # 与 Pydantic 非严格 float 字段一致：True→1.0、False→0.0
+    elif isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            raise ValueError("reading must be a finite number") from None
+    else:
+        raise ValueError("reading must be a finite number")
+    if not math.isfinite(number):
+        raise ValueError("reading must be a finite number (NaN and Infinity are not allowed)")
+    return number
+
+
+# 待校正读数：三端共用（POST 请求体两处、GET 查询参数一处）的有限浮点校验
+FiniteFloat = Annotated[float, BeforeValidator(_parse_finite_float)]
+
+
 # ---------- 请求 ----------
 
 class ObservationIn(BaseModel):
@@ -84,7 +114,7 @@ class ObservationIn(BaseModel):
 
 class CorrectionIn(BaseModel):
     timestamp: Timestamp = Field(description="待校正读数的时点：Unix 秒或 ISO 8601")
-    reading: float = Field(description="待校正的原始读数")
+    reading: FiniteFloat = Field(description="待校正的原始读数（必须为有限数值）")
 
 
 class ObservationReviseIn(ObservationIn):
